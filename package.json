@@ -1,0 +1,10 @@
+{
+  "name": "gh-archive-analytics",
+  "private": true,
+  "workspaces": ["server"],
+  "scripts": {
+    "ingest": "npm run ingest -w server --",
+    "test": "npm test -w server",
+    "typecheck": "npm run typecheck -w server"
+  }
+}
