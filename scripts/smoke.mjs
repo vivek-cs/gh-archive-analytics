@@ -10,7 +10,8 @@ import puppeteer from 'puppeteer-core';
 const args = process.argv.slice(2);
 const shotsAt = args.indexOf('--shots');
 const SHOTS = shotsAt >= 0 ? args[shotsAt + 1] : null;
-const BASE = args.find((a, i) => !a.startsWith('--') && i !== shotsAt + 1) ?? 'http://localhost:3001';
+const shotsValueAt = shotsAt >= 0 ? shotsAt + 1 : -1;
+const BASE = args.find((a, i) => !a.startsWith('--') && i !== shotsValueAt) ?? 'http://localhost:3001';
 const CHROME = process.env.CHROME_PATH ?? [
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   '/usr/bin/google-chrome',
