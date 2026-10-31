@@ -4,6 +4,7 @@
   "workspaces": ["server"],
   "scripts": {
     "ingest": "npm run ingest -w server --",
+    "serve": "npm run serve -w server --",
     "test": "npm test -w server",
     "typecheck": "npm run typecheck -w server"
   }
