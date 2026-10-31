@@ -6,7 +6,8 @@
     "ingest": "tsx src/cli/ingest.ts",
     "serve": "tsx src/cli/serve.ts",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "dev": "tsx watch src/cli/serve.ts"
   },
   "dependencies": {
     "better-sqlite3": "13.0.3",

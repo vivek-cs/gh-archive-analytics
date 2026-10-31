@@ -18,30 +18,50 @@ export function createAnalytics(db: DB) {
 
   const stmt = {
     repoByName: db.prepare('SELECT id, name FROM repos WHERE name = ? COLLATE NOCASE'),
+    searchRepos: db.prepare(`
+      SELECT r.name AS repo, (SELECT COUNT(*) FROM events e WHERE e.repo_id = r.id) AS events
+      FROM repos r WHERE r.name LIKE ? ESCAPE '\\'
+      ORDER BY (r.name = ? COLLATE NOCASE) DESC, events DESC, r.name LIMIT ?`),
     totals: db.prepare(`SELECT
         (SELECT COUNT(*) FROM events) AS events,
         (SELECT COUNT(*) FROM repos) AS repos,
         (SELECT COUNT(*) FROM pull_requests) AS pull_requests`),
     lastRun: db.prepare('SELECT source, started_at, duration_ms, stats FROM ingest_runs ORDER BY id DESC LIMIT 1'),
 
-    starsByRepo: db.prepare(`
-      SELECT e.repo_id AS id, r.name, COUNT(*) AS stars
-      FROM events e JOIN repos r ON r.id = e.repo_id
-      WHERE e.category = 'star' AND e.created_at >= ? AND e.created_at < ?
-      GROUP BY e.repo_id ORDER BY stars DESC, r.name ASC`),
+    // Momentum components for every repo with any of them in range. Events are unique by
+    // id and pull_requests has one row per PR, so nothing is double counted.
+    momentumComponents: db.prepare(`
+      WITH ev AS (
+        SELECT repo_id,
+          SUM(category = 'star') AS stars,
+          SUM(category = 'fork') AS forks,
+          SUM(category = 'issue' AND action = 'opened') AS issues_opened
+        FROM events
+        -- A plain IN list (category 'issue' = IssuesEvent) keeps this an index range scan;
+        -- an OR on type/action made SQLite scan the whole table (5ms -> 37ms).
+        WHERE category IN ('star', 'fork', 'issue') AND created_at >= @from AND created_at < @to
+        GROUP BY repo_id
+        HAVING stars + forks + issues_opened > 0 -- drop repos whose only issue activity wasn't an open
+      ), pr AS (
+        SELECT repo_id, COUNT(*) AS prs_opened FROM pull_requests
+        WHERE created_at >= @from AND created_at < @to
+        GROUP BY repo_id
+      ), active AS (SELECT repo_id FROM ev UNION SELECT repo_id FROM pr)
+      SELECT r.id, r.name,
+        COALESCE(ev.stars, 0) AS stars, COALESCE(ev.forks, 0) AS forks,
+        COALESCE(pr.prs_opened, 0) AS prs_opened, COALESCE(ev.issues_opened, 0) AS issues_opened
+      FROM active a JOIN repos r ON r.id = a.repo_id
+      LEFT JOIN ev ON ev.repo_id = a.repo_id
+      LEFT JOIN pr ON pr.repo_id = a.repo_id`),
     eventMetrics: db.prepare(`
       SELECT repo_id AS id,
-        SUM(category = 'fork') AS forks,
         COUNT(DISTINCT CASE WHEN is_bot = 0 AND category IN ${CONTRIB} THEN actor_login END) AS contributors
       FROM events
       WHERE repo_id IN (SELECT value FROM json_each(?)) AND created_at >= ? AND created_at < ?
       GROUP BY repo_id`),
-    prMetrics: db.prepare(`
-      SELECT repo_id AS id,
-        SUM(created_at >= @from AND created_at < @to) AS opened,
-        SUM(merged_at >= @from AND merged_at < @to) AS merged
-      FROM pull_requests
-      WHERE repo_id IN (SELECT value FROM json_each(@ids))
+    prsMerged: db.prepare(`
+      SELECT repo_id AS id, COUNT(*) AS merged FROM pull_requests
+      WHERE repo_id IN (SELECT value FROM json_each(?)) AND merged_at >= ? AND merged_at < ?
       GROUP BY repo_id`),
     prevStars: db.prepare(`
       SELECT repo_id AS id, COUNT(*) AS stars FROM events
@@ -121,10 +141,13 @@ export function createAnalytics(db: DB) {
     };
   }
 
-  function trending(r: Range, limit: number) {
+  function trending(r: Range, limit: number, offset = 0) {
     const cov = requireCoverage();
-    const ranked = stmt.starsByRepo.all(r.from, r.to) as { id: number; name: string; stars: number }[];
-    const top = ranked.slice(0, limit);
+    const ranked = (stmt.momentumComponents.all({ from: r.from, to: r.to }) as MomentumComponents[])
+      .map((x) => ({ ...x, score: momentumScore(x) }))
+      .sort(compareMomentum);
+    // Ranking is computed over all active repos (at most a few hundred), then paged.
+    const top = ranked.slice(offset, offset + limit);
     const ids = JSON.stringify(top.map((x) => x.id));
 
     const duration = r.to - r.from;
@@ -132,14 +155,19 @@ export function createAnalytics(db: DB) {
     const comparable = prev.from >= cov.start;
 
     const byId = <T extends { id: number }>(rows: T[]) => new Map(rows.map((x) => [x.id, x]));
-    const ev = byId(stmt.eventMetrics.all(ids, r.from, r.to) as { id: number; forks: number; contributors: number }[]);
-    const pr = byId(stmt.prMetrics.all({ ids, from: r.from, to: r.to }) as { id: number; opened: number; merged: number }[]);
+    const ev = byId(stmt.eventMetrics.all(ids, r.from, r.to) as { id: number; contributors: number }[]);
+    const merged = byId(stmt.prsMerged.all(ids, r.from, r.to) as { id: number; merged: number }[]);
     const prevStars = comparable
       ? byId(stmt.prevStars.all(prev.from, prev.to, ids) as { id: number; stars: number }[])
       : null;
 
     return {
       range: { from: iso(r.from), to: iso(r.to) },
+      ranking: {
+        by: 'momentum_score',
+        weights: MOMENTUM_WEIGHTS,
+        tie_breakers: ['stars desc', 'repo asc'],
+      },
       comparison: comparable
         ? { available: true, from: iso(prev.from), to: iso(prev.to) }
         : {
@@ -147,15 +175,20 @@ export function createAnalytics(db: DB) {
             reason: `the preceding window starts before the dataset coverage (${iso(cov.start)})`,
           },
       total: ranked.length,
+      offset,
+      limit,
+      max_score: ranked[0]?.score ?? 0, // a fixed scale for score bars on every page
       items: top.map((x, i) => {
         const previous = prevStars ? (prevStars.get(x.id)?.stars ?? 0) : null;
         return {
-          rank: i + 1,
+          rank: offset + i + 1,
           repo: x.name,
+          score: x.score,
           stars: x.stars,
-          forks: ev.get(x.id)?.forks ?? 0,
-          prs_opened: pr.get(x.id)?.opened ?? 0,
-          prs_merged: pr.get(x.id)?.merged ?? 0,
+          forks: x.forks,
+          prs_opened: x.prs_opened,
+          issues_opened: x.issues_opened,
+          prs_merged: merged.get(x.id)?.merged ?? 0,
           contributors: ev.get(x.id)?.contributors ?? 0,
           previous_stars: previous,
           stars_change: previous === null ? null : x.stars - previous,
@@ -184,12 +217,24 @@ export function createAnalytics(db: DB) {
     }
     for (const row of stmt.activityPrsOpened.all(p) as { b: number; n: number }[]) buckets[row.b]!.prs_opened = row.n;
     for (const row of stmt.activityPrsMerged.all(p) as { b: number; n: number }[]) buckets[row.b]!.prs_merged = row.n;
+    const totals = Object.fromEntries(
+      series.map((s) => [s, buckets.reduce((sum, b) => sum + (b[s] as number), 0)]),
+    );
     return {
       repo: rp.name,
       range: { from: iso(r.from), to: iso(r.to) },
       bucket: size === 3600 ? 'hour' : 'day',
       series,
+      totals,
       buckets,
+    };
+  }
+
+  // Substring match on the repo name, busiest repos first.
+  function searchRepos(query: string, limit: number) {
+    const pattern = `%${query.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+    return {
+      items: (stmt.searchRepos.all(pattern, query, limit) as { repo: string; events: number }[]),
     };
   }
 
@@ -206,6 +251,8 @@ export function createAnalytics(db: DB) {
       repo: rp.name,
       as_of: iso(cov.lastEventAt),
       total: counts.open ?? 0,
+      offset,
+      limit,
       state_counts: { open: counts.open ?? 0, merged: counts.merged ?? 0, closed: counts.closed ?? 0, unknown: counts.unknown ?? 0 },
       items: rows.map((x) => ({
         number: x.number,
@@ -272,12 +319,36 @@ export function createAnalytics(db: DB) {
     };
   }
 
-  return { coverage, requireCoverage, repo, meta, trending, activity, openPullRequests, mergedPullRequests, contributors };
+  return { coverage, requireCoverage, repo, searchRepos, meta, trending, activity, openPullRequests, mergedPullRequests, contributors };
 }
 
 export type Analytics = ReturnType<typeof createAnalytics>;
 
 const round1 = (x: number) => Math.round(x * 10) / 10;
+
+// Trending rank: score = 3·stars + 2·forks + 1·PRs opened + 0.5·issues opened, all
+// counted within the range. Integer counts times these weights are exact in floating
+// point, so scores compare reliably.
+export const MOMENTUM_WEIGHTS = { stars: 3, forks: 2, prs_opened: 1, issues_opened: 0.5 } as const;
+
+export interface MomentumComponents {
+  id: number;
+  name: string;
+  stars: number;
+  forks: number;
+  prs_opened: number;
+  issues_opened: number;
+}
+
+export function momentumScore(c: Omit<MomentumComponents, 'id' | 'name'>): number {
+  const w = MOMENTUM_WEIGHTS;
+  return w.stars * c.stars + w.forks * c.forks + w.prs_opened * c.prs_opened + w.issues_opened * c.issues_opened;
+}
+
+// Score desc, then stars desc, then name in byte order (stable across locales).
+export function compareMomentum(a: MomentumComponents & { score: number }, b: MomentumComponents & { score: number }) {
+  return b.score - a.score || b.stars - a.stars || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+}
 
 // Linear interpolation between closest ranks (same as numpy's default).
 export function quantile(sorted: number[], q: number): number | null {

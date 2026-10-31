@@ -21,9 +21,17 @@ export function createApp(db: DB) {
     res.json(a.meta());
   });
 
+  app.get('/api/repos', (req, res) => {
+    const query = q(req).q;
+    if (typeof query !== 'string' || query.trim() === '' || query.length > 100) {
+      throw new ApiError(400, 'invalid_parameter', 'q must be 1-100 characters');
+    }
+    res.json(a.searchRepos(query.trim(), parseLimit(q(req).limit, 10, 50)));
+  });
+
   app.get('/api/trending', (req, res) => {
     const range = parseRange(q(req), a.requireCoverage());
-    res.json(a.trending(range, parseLimit(q(req).limit, 25, 100)));
+    res.json(a.trending(range, parseLimit(q(req).limit, 25, 100), parseLimit(q(req).offset, 0, 1_000_000, 'offset')));
   });
 
   app.get('/api/repos/:owner/:name/activity', (req, res) => {

@@ -1,11 +1,22 @@
 {
   "name": "gh-archive-analytics",
   "private": true,
-  "workspaces": ["server"],
+  "workspaces": [
+    "server",
+    "web"
+  ],
   "scripts": {
+    "dev": "concurrently -k -n api,web -c blue,magenta \"npm run dev -w server\" \"npm run dev -w web\"",
+    "build": "npm run build -w web",
+    "start": "npm run serve -w server",
     "ingest": "npm run ingest -w server --",
     "serve": "npm run serve -w server --",
     "test": "npm test -w server",
-    "typecheck": "npm run typecheck -w server"
+    "typecheck": "npm run typecheck -w server && npm run typecheck -w web",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "devDependencies": {
+    "concurrently": "10.0.6",
+    "puppeteer-core": "25.14.0"
   }
 }

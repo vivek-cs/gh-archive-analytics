@@ -28,7 +28,7 @@ async function api(lines: string[]) {
 }
 
 describe('GET /api/trending', () => {
-  it('ranks by observed stars, breaks ties by name, and leaves out unstarred repos', async () => {
+  it('ranks star-only repos by score, breaks ties by name, and leaves out repos with no scored activity', async () => {
     const get = await api([
       star('2026-08-05T01:00:00Z', B), star('2026-08-05T02:00:00Z', B), star('2026-08-05T03:00:00Z', B, 'fan'),
       star('2026-08-05T01:00:00Z', A), star('2026-08-05T02:00:00Z', A), star('2026-08-05T03:00:00Z', A, 'fan'),
@@ -93,9 +93,140 @@ describe('GET /api/trending', () => {
     expect((await get('/api/trending?from=2026-08-03&to=2026-08-05')).comparison.available).toBe(true);
   });
 
-  it('returns an empty list, not an error, when nothing was starred', async () => {
+  it('returns an empty list, not an error, when nothing scored', async () => {
     const get = await api([]);
     expect(await get('/api/trending?from=2026-08-05&to=2026-08-06')).toMatchObject({ total: 0, items: [] });
+  });
+});
+
+describe('momentum score', () => {
+  const fork = (at: string, repo = A, opts: { id?: number } = {}) =>
+    line('ForkEvent', at, { action: 'forked' }, { repo, actor: 'forker', ...opts });
+  const issue = (action: string, at: string, repo = A, opts: { id?: number } = {}) =>
+    line('IssuesEvent', at, { action, issue: { number: 1, state: 'open' } }, { repo, ...opts });
+  const trending = async (lines: string[], range = 'from=2026-08-05&to=2026-08-06') =>
+    (await (await api(lines))(`/api/trending?${range}`)).items;
+
+  it('scores 3·stars + 2·forks + PRs opened + 0.5·issues opened, and ignores everything else', async () => {
+    const [item] = await trending([
+      star('2026-08-05T01:00:00Z'), star('2026-08-05T02:00:00Z'),                  // 2 × 3
+      fork('2026-08-05T03:00:00Z'),                                                // 1 × 2
+      prEvent('opened', 1, '2026-08-05T04:00:00Z'),                                // PR seen opening
+      prComment(2, '2026-08-07T00:00:00Z', { state: 'open', created_at: '2026-08-05T05:00:00Z' }), // created in range
+      issue('opened', '2026-08-05T06:00:00Z'), issue('opened', '2026-08-05T07:00:00Z'),
+      issue('opened', '2026-08-05T08:00:00Z'),                                     // 3 × 0.5
+      // Not scored: PR labels/merges/reviews, issue labels/closes/reopens, comments, pushes.
+      prEvent('labeled', 1, '2026-08-05T09:00:00Z'), prEvent('merged', 1, '2026-08-05T10:00:00Z'),
+      review(1, '2026-08-05T11:00:00Z'),
+      issue('labeled', '2026-08-05T12:00:00Z'), issue('closed', '2026-08-05T13:00:00Z'),
+      issue('reopened', '2026-08-05T14:00:00Z'),
+      prComment(9, '2026-08-05T15:00:00Z', { state: 'open', created_at: '2026-07-01T00:00:00Z' }),
+      push('2026-08-05T16:00:00Z', 'bob'),
+    ]);
+    expect(item).toMatchObject({
+      repo: 'acme/widget', stars: 2, forks: 1, prs_opened: 2, issues_opened: 3, prs_merged: 1,
+      score: 2 * 3 + 1 * 2 + 2 + 3 * 0.5, // 11.5
+    });
+  });
+
+  it('counts each event and each PR once, however often it appears', async () => {
+    const s = star('2026-08-05T01:00:00Z', A, 'fan');
+    const i = issue('opened', '2026-08-05T02:00:00Z');
+    const [item] = await trending([
+      s, s, s, i, i,
+      // One PR, seen through its opened event and two comment payloads.
+      prEvent('opened', 7, '2026-08-05T03:00:00Z'),
+      prEvent('opened', 7, '2026-08-05T03:00:00Z', { id: 777 }), prEvent('opened', 7, '2026-08-05T03:00:00Z', { id: 777 }),
+      prComment(7, '2026-08-05T04:00:00Z', { state: 'open', created_at: '2026-08-05T03:00:00Z' }),
+      prComment(7, '2026-08-05T05:00:00Z', { state: 'open', created_at: '2026-08-05T03:00:00Z' }),
+    ]);
+    expect(item).toMatchObject({ stars: 1, issues_opened: 1, prs_opened: 1, score: 3 + 0.5 + 1 });
+  });
+
+  it('includes events at `from` and excludes events at `to` for every component', async () => {
+    const edge = (at: string, repo: typeof A) => [
+      star(at, repo), fork(at, repo), issue('opened', at, repo),
+      prComment(1, '2026-08-08T00:00:00Z', { state: 'open', created_at: at }, { repo }),
+    ];
+    const items = await trending([...edge('2026-08-05T00:00:00Z', A), ...edge('2026-08-06T00:00:00Z', B)]);
+    expect(items.map((x: any) => [x.repo, x.score])).toEqual([['acme/widget', 3 + 2 + 1 + 0.5]]);
+  });
+
+  it('ranks by score, then stars, then name', async () => {
+    const items = await trending([
+      // B: score 6 from stars alone. A: score 6 from 1 star + 3 PRs -> B wins on stars.
+      star('2026-08-05T01:00:00Z', B), star('2026-08-05T02:00:00Z', B),
+      star('2026-08-05T01:00:00Z', A),
+      prEvent('opened', 1, '2026-08-05T01:00:00Z'), prEvent('opened', 2, '2026-08-05T01:00:00Z'),
+      prEvent('opened', 3, '2026-08-05T01:00:00Z'),
+      // C and D: identical activity -> name order.
+      fork('2026-08-05T01:00:00Z', { id: 4, name: 'zz/second' }), fork('2026-08-05T01:00:00Z', C),
+    ]);
+    expect(items.map((x: any) => [x.rank, x.repo, x.score, x.stars])).toEqual([
+      [1, 'other/repo', 6, 2], [2, 'acme/widget', 6, 1], [3, 'zeta/quiet', 2, 0], [4, 'zz/second', 2, 0],
+    ]);
+  });
+
+  it('lets repos without stars rank on other activity', async () => {
+    const items = await trending([
+      star('2026-08-05T01:00:00Z', A),                                                  // 3
+      ...[1, 2, 3, 4, 5].map((n) => prEvent('opened', n, '2026-08-05T01:00:00Z', { repo: B })), // 5
+      issue('opened', '2026-08-05T01:00:00Z', C),                                       // 0.5
+    ]);
+    expect(items.map((x: any) => [x.repo, x.score])).toEqual([['other/repo', 5], ['acme/widget', 3], ['zeta/quiet', 0.5]]);
+    expect(items[0]).toMatchObject({ stars: 0, previous_stars: 0, stars_change: 0, growth_pct: null });
+  });
+
+  it('leaves out repos whose only activity is unscored', async () => {
+    const get = await api([
+      star('2026-08-05T01:00:00Z', A),
+      issue('closed', '2026-08-05T01:00:00Z', B), issue('labeled', '2026-08-05T02:00:00Z', B),
+      prEvent('labeled', 1, '2026-08-05T01:00:00Z', { repo: C }), push('2026-08-05T01:00:00Z', 'bob', C),
+    ]);
+    const body = await get('/api/trending?from=2026-08-05&to=2026-08-06');
+    expect(body.total).toBe(1);
+    expect(body.items.map((x: any) => x.repo)).toEqual(['acme/widget']);
+  });
+
+  it('describes the ranking in the response', async () => {
+    const get = await api([star('2026-08-05T01:00:00Z')]);
+    expect((await get('/api/trending')).ranking).toEqual({
+      by: 'momentum_score',
+      weights: { stars: 3, forks: 2, prs_opened: 1, issues_opened: 0.5 },
+      tie_breakers: ['stars desc', 'repo asc'],
+    });
+  });
+});
+
+describe('pagination', () => {
+  // 7 repos with distinct scores (7 stars ... 1 star), plus 5 open PRs on acme/widget.
+  const repos = Array.from({ length: 7 }, (_, i) => ({ id: 100 + i, name: `org/r${i}` }));
+  const lines = [
+    ...repos.flatMap((r, i) => Array.from({ length: 7 - i }, (_, k) => star(`2026-08-05T0${k}:00:00Z`, r))),
+    ...[1, 2, 3, 4, 5].map((n) => prEvent('opened', n, `2026-08-${String(n + 5).padStart(2, '0')}T00:00:00Z`)), // outside the trending range
+  ];
+
+  it('pages trending results with absolute ranks and no gaps or overlaps', async () => {
+    const get = await api(lines);
+    const page = async (offset: number) => get(`/api/trending?from=2026-08-05&to=2026-08-06&limit=3&offset=${offset}`);
+    const [p1, p2, p3, p4] = await Promise.all([page(0), page(3), page(6), page(9)]);
+    expect([p1, p2, p3, p4].map((p) => [p.total, p.offset, p.limit, p.max_score]))
+      .toEqual([[7, 0, 3, 21], [7, 3, 3, 21], [7, 6, 3, 21], [7, 9, 3, 21]]);
+    expect(p1.items.map((x: any) => [x.rank, x.repo])).toEqual([[1, 'org/r0'], [2, 'org/r1'], [3, 'org/r2']]);
+    expect(p2.items.map((x: any) => [x.rank, x.repo])).toEqual([[4, 'org/r3'], [5, 'org/r4'], [6, 'org/r5']]);
+    expect(p3.items.map((x: any) => [x.rank, x.repo])).toEqual([[7, 'org/r6']]); // short last page
+    expect(p4.items).toEqual([]);                                                   // past the end
+    const all = (await get('/api/trending?from=2026-08-05&to=2026-08-06&limit=100')).items;
+    expect([...p1.items, ...p2.items, ...p3.items]).toEqual(all);
+  });
+
+  it('pages open PRs in a stable order', async () => {
+    const get = await api(lines);
+    const p1 = await get('/api/repos/acme/widget/pulls/open?limit=2&offset=0');
+    const p3 = await get('/api/repos/acme/widget/pulls/open?limit=2&offset=4');
+    expect([p1.total, p1.offset, p1.limit]).toEqual([5, 0, 2]);
+    expect(p1.items.map((x: any) => x.number)).toEqual([5, 4]); // most recently seen first
+    expect(p3.items.map((x: any) => x.number)).toEqual([1]);
   });
 });
 
@@ -111,6 +242,7 @@ describe('parameter validation', () => {
     ['/api/trending?limit=0', 'invalid_parameter'],
     ['/api/trending?limit=101', 'invalid_parameter'],
     ['/api/trending?limit=ten', 'invalid_parameter'],
+    ['/api/trending?offset=-1', 'invalid_parameter'],
     ['/api/repos/acme/widget/activity?bucket=week', 'invalid_parameter'],
     ['/api/repos/acme/widget/contributors?include_bots=maybe', 'invalid_parameter'],
     ['/api/repos/acme/widget/pulls/open?offset=-1', 'invalid_parameter'],
@@ -291,6 +423,28 @@ describe('GET /api/repos/:owner/:name/contributors', () => {
     const get = await api(lines);
     expect(await get('/api/repos/acme/widget/contributors?from=2026-08-07&to=2026-08-08'))
       .toMatchObject({ total: 0, items: [] });
+  });
+});
+
+describe('GET /api/repos (search)', () => {
+  it('matches substrings case-insensitively, exact match first, then by activity', async () => {
+    const get = await api([
+      star('2026-08-05T00:00:00Z', A), push('2026-08-05T00:00:00Z', 'x', B), push('2026-08-05T01:00:00Z', 'x', B),
+      star('2026-08-05T00:00:00Z', { id: 4, name: 'acme/widget-docs' }),
+    ]);
+    expect((await get('/api/repos?q=WIDGET')).items.map((x: any) => x.repo)).toEqual(['acme/widget', 'acme/widget-docs']);
+    expect((await get('/api/repos?q=acme/widget')).items[0]).toEqual({ repo: 'acme/widget', events: 1 });
+    expect((await get('/api/repos?q=o')).items[0].repo).toBe('filler/anchor'); // 3 events, the most
+    expect((await get('/api/repos?q=%25')).items).toEqual([]); // % is literal, not a wildcard
+    expect((await get('/api/repos?q=', 400)).error.code).toBe('invalid_parameter');
+  });
+});
+
+describe('activity totals', () => {
+  it('reports per-series totals equal to the bucket sums', async () => {
+    const get = await api([star('2026-08-03T10:00:00Z'), star('2026-08-04T10:00:00Z'), push('2026-08-03T11:00:00Z', 'bob')]);
+    const body = await get('/api/repos/acme/widget/activity?from=2026-08-01&to=2026-08-05');
+    expect(body.totals).toEqual({ stars: 2, forks: 0, prs_opened: 0, prs_merged: 0, issues: 0, reviews: 0, comments: 0, pushes: 1 });
   });
 });
 

@@ -42,13 +42,32 @@ def quantile(xs, q):  # numpy-style linear interpolation
     return round(xs[lo] + (xs[hi] - xs[lo]) * (pos - lo))
 
 
-# 1. Trending, full month: ranking and totals
-api = get('/api/trending?limit=100')
-sql = rows("""SELECT r.name, COUNT(*) c FROM events e JOIN repos r ON r.id = e.repo_id
-              WHERE e.type = 'WatchEvent' GROUP BY r.name ORDER BY c DESC, r.name LIMIT 100""")
-check('trending (month): top 100 repo/stars order', sql, [(x['repo'], x['stars']) for x in api['items']])
-check('trending (month): repos with >=1 star', rows("SELECT COUNT(DISTINCT repo_id) FROM events WHERE type='WatchEvent'")[0][0], api['total'])
-check('trending (month): comparison unavailable', False, api['comparison']['available'])
+# 1. Trending: momentum score = 3*stars + 2*forks + PRs opened + 0.5*issues opened,
+#    recomputed per repo with correlated subqueries (a different shape from the API's CTEs).
+def momentum(f, t):
+    return db.execute("""
+        SELECT name, 3*stars + 2*forks + prs + 0.5*issues AS score, stars, forks, prs, issues FROM (
+          SELECT r.name,
+            (SELECT COUNT(*) FROM events e WHERE e.repo_id=r.id AND e.type='WatchEvent' AND e.created_at>=:f AND e.created_at<:t) AS stars,
+            (SELECT COUNT(*) FROM events e WHERE e.repo_id=r.id AND e.type='ForkEvent' AND e.created_at>=:f AND e.created_at<:t) AS forks,
+            (SELECT COUNT(*) FROM pull_requests p WHERE p.repo_id=r.id AND p.created_at>=:f AND p.created_at<:t) AS prs,
+            (SELECT COUNT(*) FROM events e WHERE e.repo_id=r.id AND e.type='IssuesEvent' AND e.action='opened'
+               AND e.created_at>=:f AND e.created_at<:t) AS issues
+          FROM repos r)
+        WHERE score > 0
+        ORDER BY score DESC, stars DESC, name ASC""", {"f": f, "t": t}).fetchall()
+
+
+for label, (f, t), query in [('month', (ts('2026-08-01'), ts('2026-09-01')), ''),
+                             ('7d', (ts('2026-08-25'), ts('2026-09-01')), 'from=2026-08-25&to=2026-09-01&'),
+                             ('24h', (ts('2026-08-31'), ts('2026-09-01')), 'from=2026-08-31&to=2026-09-01&')]:
+    sql = momentum(f, t)
+    api = get(f'/api/trending?{query}limit=100')
+    check(f'trending ({label}): top 100 repo/score/components in order',
+          [(n, s, st, fk, pr, iss) for n, s, st, fk, pr, iss in sql[:100]],
+          [(x['repo'], x['score'], x['stars'], x['forks'], x['prs_opened'], x['issues_opened']) for x in api['items']])
+    check(f'trending ({label}): repos with score > 0', len(sql), api['total'])
+check('trending (month): comparison unavailable', False, get('/api/trending?limit=1')['comparison']['available'])
 
 # 2. Trending, last 7 days: every supporting metric and growth
 f, t = ts('2026-08-25'), ts('2026-09-01')
@@ -60,10 +79,15 @@ for item in api['items']:
     q = lambda sql, *a: rows(sql, rid, *a)[0][0]
     stars = q("SELECT COUNT(*) FROM events WHERE repo_id=? AND type='WatchEvent' AND created_at>=? AND created_at<?", f, t)
     prev = q("SELECT COUNT(*) FROM events WHERE repo_id=? AND type='WatchEvent' AND created_at>=? AND created_at<?", pf, f)
+    forks = q("SELECT COUNT(*) FROM events WHERE repo_id=? AND type='ForkEvent' AND created_at>=? AND created_at<?", f, t)
+    prs = q('SELECT COUNT(*) FROM pull_requests WHERE repo_id=? AND created_at>=? AND created_at<?', f, t)
+    issues = q("SELECT COUNT(*) FROM events WHERE repo_id=? AND type='IssuesEvent' AND action='opened' AND created_at>=? AND created_at<?", f, t)
     expected = {
+        'score': 3 * stars + 2 * forks + prs + 0.5 * issues,
         'stars': stars,
-        'forks': q("SELECT COUNT(*) FROM events WHERE repo_id=? AND type='ForkEvent' AND created_at>=? AND created_at<?", f, t),
-        'prs_opened': q('SELECT COUNT(*) FROM pull_requests WHERE repo_id=? AND created_at>=? AND created_at<?', f, t),
+        'forks': forks,
+        'prs_opened': prs,
+        'issues_opened': issues,
         'prs_merged': q('SELECT COUNT(*) FROM pull_requests WHERE repo_id=? AND merged_at>=? AND merged_at<?', f, t),
         'contributors': q(f"""SELECT COUNT(DISTINCT actor_login) FROM events WHERE repo_id=? AND created_at>=? AND created_at<?
                               AND category IN {CONTRIB} AND actor_login NOT LIKE '%[bot]'""", f, t),
